@@ -1,5 +1,67 @@
-node_modules
-*.swp
-npm-debug.log
+# Dependencies
+node_modules/
+
+# Build outputs
 build/
+dist/
+*.tgz
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage
+coverage/
+*.lcov
+.nyc_output
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Package manager
+yarn.lock
+pnpm-lock.yaml
+
+# Test artifacts
+test-results/
+*.test.js.map
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Project specific
 curvejs/
+
+# Native build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll

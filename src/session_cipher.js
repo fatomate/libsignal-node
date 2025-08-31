@@ -9,6 +9,8 @@ const curve = require('./curve');
 const errors = require('./errors');
 const protobufs = require('./protobufs');
 const queueJob = require('./queue_job');
+const { MutexManager } = require('./mutex_manager');
+const { createCachedStorage } = require('./session_cache');
 
 const VERSION = 3;
 
@@ -22,12 +24,24 @@ function assertBuffer(value) {
 
 class SessionCipher {
 
-    constructor(storage, protocolAddress) {
+    constructor(storage, protocolAddress, options = {}) {
         if (!(protocolAddress instanceof ProtocolAddress)) {
             throw new TypeError("protocolAddress must be a ProtocolAddress");
         }
         this.addr = protocolAddress;
-        this.storage = storage;
+        
+        // Use cached storage if not already cached
+        this.storage = storage._cache ? storage : createCachedStorage(storage, options.cacheOptions);
+        
+        // Initialize mutex manager
+        this.mutexManager = options.mutexManager || new MutexManager(options.mutexOptions);
+        
+        // Configuration
+        this.config = {
+            useLegacyQueue: options.useLegacyQueue || false,
+            mutexTimeout: options.mutexTimeout || 30000,
+            enableMetrics: options.enableMetrics !== false
+        };
     }
 
     _encodeTupleByte(number1, number2) {
@@ -53,13 +67,37 @@ class SessionCipher {
         return record;
     }
 
+    async getRecordCached() {
+        // Use cached version when available
+        if (this.storage._cache && this.storage._cache.has(this.addr.toString())) {
+            return await this.storage.loadSession(this.addr.toString());
+        }
+        return await this.getRecord();
+    }
+
     async storeRecord(record) {
         record.removeOldSessions();
         await this.storage.storeSession(this.addr.toString(), record);
+        
+        // Flush cache if needed
+        if (this.storage.flush && !this.config.useLegacyQueue) {
+            // Batch flush for better performance
+            setImmediate(() => this.storage.flush(this.addr.toString()));
+        }
     }
 
     async queueJob(awaitable) {
-        return await queueJob(this.addr.toString(), awaitable);
+        // Support both legacy queue and new mutex system
+        if (this.config.useLegacyQueue) {
+            return await queueJob(this.addr.toString(), awaitable);
+        }
+        
+        // Use mutex manager for better concurrency control
+        return await this.mutexManager.withMutex(
+            this.addr.toString(),
+            awaitable,
+            { timeout: this.config.mutexTimeout }
+        );
     }
 
     async encrypt(data) {
@@ -141,19 +179,38 @@ class SessionCipher {
             throw new errors.SessionError("No sessions available");
         }   
         const errs = [];
-        for (const session of sessions) {
-            let plaintext; 
+        
+        // Try sessions in parallel for better performance (with mutex protection)
+        const decryptPromises = sessions.map(async (session) => {
             try {
-                plaintext = await this.doDecryptWhisperMessage(data, session);
+                const plaintext = await this.doDecryptWhisperMessage(data, session);
                 session.indexInfo.used = Date.now();
                 return {
                     session,
-                    plaintext
+                    plaintext,
+                    success: true
                 };
             } catch(e) {
-                errs.push(e);
+                return {
+                    error: e,
+                    success: false
+                };
             }
+        });
+        
+        // Use Promise.race for first successful decryption
+        const results = await Promise.all(decryptPromises);
+        const successfulResult = results.find(r => r.success);
+        
+        if (successfulResult) {
+            return {
+                session: successfulResult.session,
+                plaintext: successfulResult.plaintext
+            };
         }
+        
+        // Collect all errors for debugging
+        const allErrors = results.filter(r => !r.success).map(r => r.error);
         throw new errors.SessionError("No matching sessions found for message");
     }
 
@@ -304,7 +361,7 @@ class SessionCipher {
 
     async hasOpenSession() {
         return await this.queueJob(async () => {
-            const record = await this.getRecord();
+            const record = await this.getRecordCached();
             if (!record) {
                 return false;
             }
@@ -323,6 +380,42 @@ class SessionCipher {
                 }
             }
         });
+    }
+
+    /**
+     * Get metrics for this cipher instance
+     * @returns {Object} Metrics object
+     */
+    getMetrics() {
+        const metrics = {
+            address: this.addr.toString(),
+            mutexMetrics: this.mutexManager ? this.mutexManager.getMetrics() : null,
+            cacheStats: this.storage.getStats ? this.storage.getStats() : null
+        };
+        return metrics;
+    }
+
+    /**
+     * Warm the cache for this session
+     */
+    async warmCache() {
+        if (this.storage.warmCache) {
+            await this.storage.warmCache(10);
+        }
+        // Preload this session
+        await this.getRecordCached();
+    }
+
+    /**
+     * Clear cache for this session
+     */
+    clearCache() {
+        if (this.storage._cache) {
+            this.storage._cache.invalidate(this.addr.toString());
+        }
+        if (this.mutexManager) {
+            this.mutexManager.clearMutex(this.addr.toString());
+        }
     }
 }
 

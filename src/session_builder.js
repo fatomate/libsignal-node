@@ -8,17 +8,37 @@ const crypto = require('./crypto');
 const curve = require('./curve');
 const errors = require('./errors');
 const queueJob = require('./queue_job');
+const { MutexManager } = require('./mutex_manager');
+const { createCachedStorage } = require('./session_cache');
 
 class SessionBuilder {
 
-    constructor(storage, protocolAddress) {
+    constructor(storage, protocolAddress, options = {}) {
         this.addr = protocolAddress;
-        this.storage = storage;
+        
+        // Use cached storage if not already cached
+        this.storage = storage._cache ? storage : createCachedStorage(storage, options.cacheOptions);
+        
+        // Initialize mutex manager
+        this.mutexManager = options.mutexManager || new MutexManager(options.mutexOptions);
+        
+        // Configuration
+        this.config = {
+            useLegacyQueue: options.useLegacyQueue || false,
+            mutexTimeout: options.mutexTimeout || 30000,
+            enableMetrics: options.enableMetrics !== false
+        };
     }
 
     async initOutgoing(device) {
         const fqAddr = this.addr.toString();
-        return await queueJob(fqAddr, async () => {
+        
+        // Choose between legacy queue and mutex system
+        const executeWithLock = this.config.useLegacyQueue ? 
+            (fn) => queueJob(fqAddr, fn) :
+            (fn) => this.mutexManager.withMutex(fqAddr, fn, { timeout: this.config.mutexTimeout });
+        
+        return await executeWithLock(async () => {
             if (!await this.storage.isTrustedIdentity(this.addr.id, device.identityKey)) {
                 throw new errors.UntrustedIdentityKeyError(this.addr.id, device.identityKey);
             }
@@ -47,34 +67,52 @@ class SessionBuilder {
             }
             record.setSession(session);
             await this.storage.storeSession(fqAddr, record);
+            
+            // Flush cache if needed
+            if (this.storage.flush && !this.config.useLegacyQueue) {
+                setImmediate(() => this.storage.flush(fqAddr));
+            }
         });
     }
 
     async initIncoming(record, message) {
         const fqAddr = this.addr.toString();
-        if (!await this.storage.isTrustedIdentity(fqAddr, message.identityKey)) {
-            throw new errors.UntrustedIdentityKeyError(this.addr.id, message.identityKey);
+        
+        // Use transaction for atomic operations
+        const executeTransaction = async () => {
+            if (!await this.storage.isTrustedIdentity(fqAddr, message.identityKey)) {
+                throw new errors.UntrustedIdentityKeyError(this.addr.id, message.identityKey);
+            }
+            if (record.getSession(message.baseKey)) {
+                // This just means we haven't replied.
+                return;
+            }
+            const preKeyPair = await this.storage.loadPreKey(message.preKeyId);
+            if (message.preKeyId && !preKeyPair) {
+                throw new errors.PreKeyError('Invalid PreKey ID');
+            }   
+            const signedPreKeyPair = await this.storage.loadSignedPreKey(message.signedPreKeyId);
+            if (!signedPreKeyPair) { 
+                throw new errors.PreKeyError("Missing SignedPreKey");
+            }   
+            const existingOpenSession = record.getOpenSession();
+            if (existingOpenSession) {
+                record.closeSession(existingOpenSession);
+            }
+            record.setSession(await this.initSession(false, preKeyPair, signedPreKeyPair,
+                                                     message.identityKey, message.baseKey,
+                                                     undefined, message.registrationId));
+            return message.preKeyId;
+        };
+        
+        // Execute with proper locking if not already in a transaction
+        if (!this.config.useLegacyQueue && this.mutexManager) {
+            return await this.mutexManager.withMutex(fqAddr, executeTransaction, { 
+                timeout: this.config.mutexTimeout 
+            });
         }
-        if (record.getSession(message.baseKey)) {
-            // This just means we haven't replied.
-            return;
-        }
-        const preKeyPair = await this.storage.loadPreKey(message.preKeyId);
-        if (message.preKeyId && !preKeyPair) {
-            throw new errors.PreKeyError('Invalid PreKey ID');
-        }   
-        const signedPreKeyPair = await this.storage.loadSignedPreKey(message.signedPreKeyId);
-        if (!signedPreKeyPair) { 
-            throw new errors.PreKeyError("Missing SignedPreKey");
-        }   
-        const existingOpenSession = record.getOpenSession();
-        if (existingOpenSession) {
-            record.closeSession(existingOpenSession);
-        }
-        record.setSession(await this.initSession(false, preKeyPair, signedPreKeyPair,
-                                                 message.identityKey, message.baseKey,
-                                                 undefined, message.registrationId));
-        return message.preKeyId;
+        
+        return await executeTransaction();
     }
 
     async initSession(isInitiator, ourEphemeralKey, ourSignedKey, theirIdentityPubKey,
