@@ -68,9 +68,9 @@ class SessionBuilder {
             record.setSession(session);
             await this.storage.storeSession(fqAddr, record);
             
-            // Flush cache if needed
+            // Flush cache synchronously to avoid race conditions
             if (this.storage.flush && !this.config.useLegacyQueue) {
-                setImmediate(() => this.storage.flush(fqAddr));
+                await this.storage.flush(fqAddr);
             }
         });
     }

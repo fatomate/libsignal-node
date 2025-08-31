@@ -271,6 +271,13 @@ class SessionCipher {
             console.debug(errorMsg);
         }
         
+        // Opportunistic cleanup of unhealthy sessions (non-blocking)
+        // Run in background to avoid adding latency to critical path
+        // Ignore errors from cleanup
+        Promise.resolve()
+            .then(() => this.cleanupUnhealthySessions())
+            .catch(() => {});
+
         // Throw error with metadata for better handling upstream
         throw new errors.SessionError("No matching sessions found for message", {
             sessionCount: sessions.length,
