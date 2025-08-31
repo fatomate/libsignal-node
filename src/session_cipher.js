@@ -36,11 +36,16 @@ class SessionCipher {
         // Initialize mutex manager
         this.mutexManager = options.mutexManager || new MutexManager(options.mutexOptions);
         
+        // Session health tracking (separate from session objects to avoid mutation)
+        this.sessionHealth = new Map(); // Maps session baseKey to health data
+        
         // Configuration
         this.config = {
             useLegacyQueue: options.useLegacyQueue || false,
             mutexTimeout: options.mutexTimeout || 30000,
-            enableMetrics: options.enableMetrics !== false
+            enableMetrics: options.enableMetrics !== false,
+            maxSessionFailures: options.maxSessionFailures || 10,
+            sessionMaxAge: options.sessionMaxAge || 7 * 24 * 60 * 60 * 1000 // 7 days
         };
     }
 
@@ -79,10 +84,14 @@ class SessionCipher {
         record.removeOldSessions();
         await this.storage.storeSession(this.addr.toString(), record);
         
-        // Flush cache if needed
+        // Flush cache synchronously to avoid race conditions
         if (this.storage.flush && !this.config.useLegacyQueue) {
-            // Batch flush for better performance
-            setImmediate(() => this.storage.flush(this.addr.toString()));
+            try {
+                await this.storage.flush(this.addr.toString());
+            } catch (e) {
+                console.debug('Cache flush failed:', e.message);
+                // Non-critical error, continue
+            }
         }
     }
 
@@ -178,40 +187,97 @@ class SessionCipher {
         if (!sessions.length) {
             throw new errors.SessionError("No sessions available");
         }   
+        
         const errs = [];
+        let successfulSession = null;
+        let plaintext = null;
+        const sessionsToRemove = [];
+        let macErrorCount = 0;
         
-        // Try sessions in parallel for better performance (with mutex protection)
-        const decryptPromises = sessions.map(async (session) => {
+        // Try sessions sequentially to avoid race conditions
+        // This prevents session state corruption from parallel modifications
+        for (const session of sessions) {
+            const sessionKey = session.indexInfo.baseKey.toString('base64');
+            
             try {
-                const plaintext = await this.doDecryptWhisperMessage(data, session);
+                plaintext = await this.doDecryptWhisperMessage(data, session);
+                
+                // Success! Update health tracking
+                this.updateSessionHealth(sessionKey, true);
                 session.indexInfo.used = Date.now();
-                return {
-                    session,
-                    plaintext,
-                    success: true
-                };
+                successfulSession = session;
+                break; // Stop trying other sessions
+                
             } catch(e) {
-                return {
+                // Track failure in separate health tracking (not on session object)
+                this.updateSessionHealth(sessionKey, false);
+                
+                // Expected behavior: old sessions will fail MAC verification
+                if (e.message === 'Bad MAC') {
+                    macErrorCount++;
+                    
+                    // Check if this session should be marked for removal
+                    const health = this.getSessionHealth(sessionKey);
+                    const sessionAge = Date.now() - (session.indexInfo.created || 0);
+                    
+                    if (sessionAge > this.config.sessionMaxAge && 
+                        health.failureCount > this.config.maxSessionFailures) {
+                        sessionsToRemove.push(session);
+                    }
+                }
+                
+                // Only collect errors for debugging, don't log each one
+                const health = this.getSessionHealth(sessionKey);
+                errs.push({
                     error: e,
-                    success: false
-                };
+                    sessionInfo: {
+                        baseKey: sessionKey.substring(0, 8) + '...',
+                        created: session.indexInfo.created,
+                        used: session.indexInfo.used,
+                        failureCount: health.failureCount,
+                        successRate: health.successRate
+                    }
+                });
+                
+                // If it's not a MAC error, it might be more serious
+                if (e.message !== 'Bad MAC' && e.message !== 'Key used already or never filled') {
+                    console.debug('Unexpected error during decryption:', e.message);
+                }
             }
-        });
+        }
         
-        // Use Promise.race for first successful decryption
-        const results = await Promise.all(decryptPromises);
-        const successfulResult = results.find(r => r.success);
-        
-        if (successfulResult) {
+        if (successfulSession && plaintext) {
+            // Mark old failing sessions for removal (without mutating them)
+            if (sessionsToRemove.length > 0) {
+                console.debug(`Marking ${sessionsToRemove.length} unhealthy sessions for cleanup`);
+                sessionsToRemove.forEach(s => {
+                    s.indexInfo.markedForRemoval = true;
+                });
+            }
+            
             return {
-                session: successfulResult.session,
-                plaintext: successfulResult.plaintext
+                session: successfulSession,
+                plaintext: plaintext
             };
         }
         
-        // Collect all errors for debugging
-        const allErrors = results.filter(r => !r.success).map(r => r.error);
-        throw new errors.SessionError("No matching sessions found for message");
+        // Provide detailed error context
+        const errorMsg = macErrorCount === errs.length ? 
+            `All ${errs.length} sessions failed with MAC errors (expected for old sessions)` :
+            `Failed to decrypt with ${errs.length} sessions (${macErrorCount} MAC errors)`;
+        
+        // Only log if it's not all MAC errors (which are expected)
+        if (macErrorCount < errs.length) {
+            console.debug(errorMsg);
+        }
+        
+        // Throw error with metadata for better handling upstream
+        throw new errors.SessionError("No matching sessions found for message", {
+            sessionCount: sessions.length,
+            macErrorCount: macErrorCount,
+            otherErrorCount: errs.length - macErrorCount,
+            silent: macErrorCount === errs.length // Silent if all errors were MAC errors
+        });
     }
 
     async decryptWhisperMessage(data) {
@@ -416,6 +482,96 @@ class SessionCipher {
         if (this.mutexManager) {
             this.mutexManager.clearMutex(this.addr.toString());
         }
+        // Clear health tracking data
+        this.sessionHealth.clear();
+    }
+    
+    /**
+     * Update session health tracking
+     * @private
+     */
+    updateSessionHealth(sessionKey, success) {
+        if (!this.sessionHealth.has(sessionKey)) {
+            this.sessionHealth.set(sessionKey, {
+                successCount: 0,
+                failureCount: 0,
+                lastAttempt: Date.now(),
+                firstSeen: Date.now()
+            });
+        }
+        
+        const health = this.sessionHealth.get(sessionKey);
+        health.lastAttempt = Date.now();
+        
+        if (success) {
+            health.successCount++;
+            health.consecutiveFailures = 0;
+        } else {
+            health.failureCount++;
+            health.consecutiveFailures = (health.consecutiveFailures || 0) + 1;
+        }
+        
+        // Calculate success rate
+        const total = health.successCount + health.failureCount;
+        health.successRate = total > 0 ? (health.successCount / total) : 0;
+    }
+    
+    /**
+     * Get session health data
+     * @private
+     */
+    getSessionHealth(sessionKey) {
+        if (!this.sessionHealth.has(sessionKey)) {
+            return {
+                successCount: 0,
+                failureCount: 0,
+                successRate: 0,
+                consecutiveFailures: 0,
+                lastAttempt: null,
+                firstSeen: Date.now()
+            };
+        }
+        return this.sessionHealth.get(sessionKey);
+    }
+    
+    /**
+     * Clean up unhealthy sessions
+     */
+    async cleanupUnhealthySessions() {
+        const record = await this.getRecord();
+        if (!record) return;
+        
+        let removedCount = 0;
+        const sessions = record.getSessions();
+        
+        for (const session of sessions) {
+            const sessionKey = session.indexInfo.baseKey.toString('base64');
+            const health = this.getSessionHealth(sessionKey);
+            const sessionAge = Date.now() - (session.indexInfo.created || 0);
+            
+            // Remove if:
+            // 1. Very old and many failures
+            // 2. Only failures (no successes) after many attempts
+            // 3. Very low success rate after significant usage
+            const shouldRemove = (
+                (sessionAge > this.config.sessionMaxAge && health.failureCount > this.config.maxSessionFailures) ||
+                (health.failureCount > 20 && health.successCount === 0) ||
+                (health.failureCount > 50 && health.successRate < 0.1)
+            );
+            
+            if (shouldRemove) {
+                session.indexInfo.markedForRemoval = true;
+                removedCount++;
+            }
+        }
+        
+        if (removedCount > 0) {
+            console.debug(`Cleanup: Marked ${removedCount} unhealthy sessions for removal`);
+            record.removeOldSessions();
+            await this.storeRecord(record);
+        }
+        
+        return removedCount;
     }
 }
 

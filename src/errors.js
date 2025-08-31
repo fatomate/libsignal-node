@@ -12,9 +12,11 @@ exports.UntrustedIdentityKeyError = class UntrustedIdentityKeyError extends expo
 };
 
 exports.SessionError = class SessionError extends exports.SignalError {
-    constructor(message) {
+    constructor(message, metadata = {}) {
         super(message);
         this.name = 'SessionError';
+        this.metadata = metadata; // Additional context like MAC error count
+        this.silent = metadata.silent || false; // Flag for silent errors
     }
 };
 

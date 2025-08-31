@@ -280,6 +280,14 @@ class SessionRecord {
     }
 
     removeOldSessions() {
+        // First, remove sessions marked for removal
+        for (const [key, session] of Object.entries(this.sessions)) {
+            if (session.indexInfo.markedForRemoval) {
+                delete this.sessions[key];
+            }
+        }
+        
+        // Then apply the original limit-based cleanup
         while (Object.keys(this.sessions).length > CLOSED_SESSIONS_MAX) {
             let oldestKey;
             let oldestSession;
